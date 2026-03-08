@@ -2,6 +2,8 @@
 
 A configurable status line for Claude Code that displays context, token usage, cost, and git branch information.
 
+![constatus screenshot](assets/screenshot.png)
+
 ## Installation
 
 ### With Cargo
