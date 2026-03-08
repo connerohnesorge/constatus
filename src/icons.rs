@@ -2,7 +2,19 @@
 
 pub const MODEL: &str = "\u{f01fc}"; // 󰇼 nf-md-brain
 pub const FOLDER: &str = "\u{f07c}";  //  nf-fa-folder_open
-pub const CONTEXT: &str = "\u{f0e7}"; //  nf-fa-bolt
+/// Returns a moon phase icon based on context window used percentage.
+/// ● (full moon) when fresh, degrades to ○ (empty moon) as context fills up.
+pub fn context_icon(used_pct: f64) -> &'static str {
+    if used_pct < 25.0 {
+        "●" // U+25CF full moon – fresh context
+    } else if used_pct < 50.0 {
+        "◑" // U+25D1 half moon
+    } else if used_pct < 75.0 {
+        "◔" // U+25D4 quarter moon
+    } else {
+        "○" // U+25CB empty moon – context nearly gone
+    }
+}
 pub const CACHE: &str = "\u{f1c0}";   //  nf-fa-database
 pub const INPUT: &str = "\u{f063}";   //  nf-fa-arrow_down
 pub const OUTPUT: &str = "\u{f062}";  //  nf-fa-arrow_up

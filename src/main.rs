@@ -260,7 +260,7 @@ fn extract_fields(
     let context = used
         .map(|p| {
             let icon = if use_icons {
-                format!("{} ", icons::CONTEXT)
+                format!("{} ", icons::context_icon(p))
             } else {
                 String::new()
             };
