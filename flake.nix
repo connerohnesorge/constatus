@@ -66,8 +66,6 @@
         src = ./.;
         pname = "constatus";
         version = "0.2.0";
-        # Let cargo handle dependency resolution
-        cargoVendorDir = null;
         strictDeps = true;
       };
     in {
