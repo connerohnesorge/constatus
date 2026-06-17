@@ -1,12 +1,11 @@
 //! Optional GitLab API integration: latest pipeline status and open
 //! merge-request count for the current branch.
 //!
-//! To stay faithful to this tool's offline-first, dependency-light design we
-//! shell out to `curl` (already mirroring the `git` subprocess pattern) and
-//! parse responses with the `serde_json` we already depend on — no TLS crate
-//! stack, no changes to the Nix build. Results are cached on disk with a short
-//! TTL so a frequently-rendered status line never makes more than one request
-//! per cache window, and a bounded `--max-time` means a render never hangs.
+//! Requests are made in-process with `ureq` (blocking, rustls) — no subprocess
+//! to spawn and the token never leaves this process. The pipeline and MR calls
+//! run concurrently, each bounded by an overall timeout so a render never
+//! hangs, and results are cached on disk with a short TTL so a frequently
+//! rendered status line makes at most one round of calls per cache window.
 
 use crate::color::Color;
 use crate::forge::Remote;
@@ -16,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Tunables for the optional API integration.
 pub struct Config {
-    /// Hard cap (seconds) on each curl request — bounds render latency.
+    /// Hard cap (seconds) on each API request — bounds render latency.
     pub timeout_secs: u64,
     /// How long a cached result is reused before re-fetching (seconds).
     pub cache_secs: u64,
@@ -45,8 +44,12 @@ pub fn token_from_env() -> Option<String> {
 /// Fetch (or serve from cache) the pipeline + MR status for `branch`.
 /// Caller guarantees `remote.forge == Forge::GitLab` and a non-empty token.
 pub fn fetch_status(remote: &Remote, branch: &str, token: &str, cfg: &Config) -> Status {
-    // Never send the token to a host we don't actually trust.
-    if !host_is_gitlab_api_allowed(&remote.host) {
+    // Never send the token to a host we don't trust, and validate the host and
+    // token before they enter a URL or header (defense in depth).
+    if !host_is_gitlab_api_allowed(&remote.host)
+        || !host_is_safe(&remote.host)
+        || !token_is_safe(token)
+    {
         return Status::default();
     }
 
@@ -56,15 +59,37 @@ pub fn fetch_status(remote: &Remote, branch: &str, token: &str, cfg: &Config) ->
         return cached;
     }
 
-    // Issue both requests concurrently: spawn both curls, then collect both, so
-    // a cache miss blocks for ~1x the timeout instead of 2x (serial).
-    let pipeline_child = api_spawn(remote, &pipeline_path(&remote.project, branch), token, cfg);
-    let mr_child = api_spawn(remote, &mr_path(&remote.project, branch), token, cfg);
+    // Issue both requests concurrently (pipeline on a worker thread, MRs on
+    // this one) so a cache miss blocks for ~1x the timeout instead of 2x.
+    let timeout = std::time::Duration::from_secs(cfg.timeout_secs.max(1));
+    // Disable redirects so a 3xx from the (trusted) API host can never re-send
+    // the PRIVATE-TOKEN header to another host — matching curl's no-`-L`
+    // behavior, since these GET endpoints only ever return 200 in normal use.
+    // https_only forbids an http downgrade; timeout_connect bounds the TCP
+    // connect (the request `.timeout()` only covers TLS + read) so a
+    // black-holed host can't stall the render.
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(timeout)
+        .redirects(0)
+        .https_only(true)
+        .build();
+    let pipeline_url = api_url(&remote.host, &pipeline_path(&remote.project, branch));
+    let mr_url = api_url(&remote.host, &mr_path(&remote.project, branch));
 
-    let pipeline = api_collect(pipeline_child)
+    let worker = {
+        let agent = agent.clone();
+        let token = token.to_string();
+        std::thread::spawn(move || http_get(&agent, &pipeline_url, &token, timeout))
+    };
+    let mr_count = http_get(&agent, &mr_url, token, timeout)
+        .as_deref()
+        .map(parse_mr_count);
+    let pipeline = worker
+        .join()
+        .ok()
+        .flatten()
         .as_deref()
         .and_then(parse_pipeline_status);
-    let mr_count = api_collect(mr_child).as_deref().map(parse_mr_count);
 
     let status = Status { pipeline, mr_count };
     // Always cache (even an empty/failed result) to back off and avoid
@@ -121,7 +146,7 @@ fn host_matches_allowlist(host: &str, list: &str) -> bool {
         .any(|allowed| allowed.eq_ignore_ascii_case(host))
 }
 
-/// A hostname is safe to embed in curl's config when it contains only the
+/// A hostname is safe to embed in a request URL when it contains only the
 /// characters a real DNS host uses — never quotes, spaces, or newlines.
 fn host_is_safe(host: &str) -> bool {
     !host.is_empty()
@@ -130,8 +155,8 @@ fn host_is_safe(host: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
 }
 
-/// A token is safe to embed when every byte is printable ASCII (no spaces,
-/// control chars, or `"`), matching the shape of real GitLab tokens.
+/// A token is safe to send as a header value when every byte is printable
+/// ASCII (no spaces, control chars, or `"`), matching real GitLab tokens.
 fn token_is_safe(token: &str) -> bool {
     !token.is_empty() && token.bytes().all(|b| b.is_ascii_graphic() && b != b'"')
 }
@@ -207,63 +232,32 @@ pub fn pipeline_color(status: &str) -> Color {
     }
 }
 
-// ---- curl transport --------------------------------------------------------
+// ---- HTTP transport --------------------------------------------------------
 
-/// Start an authenticated GET against the project's API without waiting for it.
-/// The token is passed via curl's stdin config (`--config -`) rather than argv
-/// so it never appears in the process list. Returns the spawned child, or None
-/// if the inputs are unsafe to embed or curl could not be started.
-fn api_spawn(
-    remote: &Remote,
-    path: &str,
-    token: &str,
-    cfg: &Config,
-) -> Option<std::process::Child> {
-    // The host and token are interpolated into curl's stdin config; refuse
-    // anything that could break out of the quoted `url`/`header` lines (e.g.
-    // a `"` or newline in a hostile repo's remote URL injecting curl options).
-    // `path` is built only from percent-encoded components, so it is safe.
-    if !host_is_safe(&remote.host) || !token_is_safe(token) {
-        return None;
-    }
-
-    let url = format!("https://{}/api/v4{}", remote.host, path);
-    let timeout = cfg.timeout_secs.max(1).to_string();
-
-    let mut child = std::process::Command::new("curl")
-        .args([
-            "--silent",
-            "--show-error",
-            "--fail",
-            "--max-time",
-            &timeout,
-            "--config",
-            "-",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-
-    {
-        let mut stdin = child.stdin.take()?;
-        // curl config-file syntax; quoting keeps the header value intact and
-        // the token out of argv.
-        let config = format!("url = \"{url}\"\nheader = \"PRIVATE-TOKEN: {token}\"\n");
-        stdin.write_all(config.as_bytes()).ok()?;
-    } // stdin dropped/closed here so curl can proceed
-
-    Some(child)
+fn api_url(host: &str, path: &str) -> String {
+    format!("https://{host}/api/v4{path}")
 }
 
-/// Wait for a spawned request and return its body on HTTP success, else None.
-fn api_collect(child: Option<std::process::Child>) -> Option<String> {
-    let out = child?.wait_with_output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+/// One authenticated GET via `agent`. The token is sent as a request header
+/// from within this process, so — unlike a `curl` subprocess — it never touches
+/// argv or any other process. Returns the response body, or None on a `>= 400`
+/// status, timeout, or transport error. The agent disables redirects (so the
+/// token is never re-sent to another host) and bounds connect + TLS + read by
+/// `timeout`; only a pathological DNS lookup is bounded by the OS resolver.
+fn http_get(
+    agent: &ureq::Agent,
+    url: &str,
+    token: &str,
+    timeout: std::time::Duration,
+) -> Option<String> {
+    agent
+        .get(url)
+        .set("PRIVATE-TOKEN", token)
+        .timeout(timeout)
+        .call()
+        .ok()?
+        .into_string()
+        .ok()
 }
 
 // ---- on-disk cache ---------------------------------------------------------

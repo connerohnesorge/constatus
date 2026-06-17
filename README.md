@@ -170,16 +170,16 @@ export CONSTATUS_GITLAB_HOST=gitlab.example.com
 
 **How it works (and why it's safe for a status line):**
 
-- Requests are made by shelling out to `curl` (no extra build dependencies);
-  the token is passed via curl's stdin config, never in the process arguments.
+- Requests are made in-process with a small blocking HTTP client (`ureq` +
+  rustls), so there is no subprocess to spawn and the token is sent only as a
+  request header — it never appears in an argument list or any other process.
 - Each request is bounded by `--gitlab-timeout` (default 2s, and the pipeline +
   MR requests run concurrently) so a render never hangs. Results are cached
   under `$XDG_CACHE_HOME/constatus` (or `~/.cache/constatus`) for
   `--gitlab-cache` seconds (default 30s), so a frequently-redrawn status line
   makes at most one round of API calls (pipeline + MRs) per cache window.
-- Anything missing or failing (no token, no `curl`, network error, untrusted or
-  non-GitLab remote) is silently omitted — pair the placeholders with `?` to
-  hide them.
+- Anything missing or failing (no token, network error, untrusted or non-GitLab
+  remote) is silently omitted — pair the placeholders with `?` to hide them.
 - Disable the API path entirely with `--no-gitlab`; `{forge}` still works.
 
 `{pipeline}` is colored by status (green = passed, red = failed, yellow =

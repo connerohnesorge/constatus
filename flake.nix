@@ -67,6 +67,8 @@
         pname = "constatus";
         version = "0.3.0";
         strictDeps = true;
+        # ring (via ureq's rustls TLS) needs perl + a C compiler at build time.
+        nativeBuildInputs = [pkgs.perl];
       };
     in {
       # Flake outputs for this system
@@ -89,6 +91,7 @@
             deadnix           # Find unused Nix code
             # General tools
             just              # Task runner
+            perl              # Build dep for ring (ureq's rustls TLS)
             # Rust toolchain
             rust-bin.stable.latest.default  # Compiler & cargo
             rust-bin.stable.latest.rust-analyzer  # IDE support
