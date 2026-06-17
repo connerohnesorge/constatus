@@ -1,8 +1,10 @@
 # constatus
 
-A configurable status line for Claude Code that displays context, token usage, cost, and git branch information.
+A configurable status line for Claude Code that displays context, token usage, cost, git branch, and hosting-forge information (with optional GitLab pipeline/MR status).
 
 ![constatus screenshot](assets/screenshot.png)
+
+*The screenshot shows the default (non-GitLab) preset; the `{forge}`, `{pipeline}`, and `{mr}` fields are illustrated in the examples below.*
 
 ## Installation
 
@@ -41,7 +43,7 @@ echo '{"model":{"display_name":"Claude Opus 4.6"},"workspace":{"current_dir":"/h
 
 **Default preset:**
 ```
-󰇼 Claude Opus 4.6 │  project │  main │ [███░░░░░░░] 30% │ 256K cached │ 💰 $0.15
+󰇼 Claude Opus 4.6 │  project │  main │  gitlab │ [███░░░░░░░] 30% │ 256K cached │  passed │ 💰 $0.15
 ```
 
 ## Placeholders
@@ -51,6 +53,7 @@ The following placeholders are available in format strings:
 - `{model}` — AI model name
 - `{dir}` — Current directory name
 - `{branch}` — Git branch name
+- `{forge}` — Hosting forge detected from the git remote (GitLab, GitHub, Bitbucket, …)
 - `{context}` — Context window usage percentage
 - `{bar}` — Visual progress bar
 - `{cache}` — Cache read tokens
@@ -58,6 +61,8 @@ The following placeholders are available in format strings:
 - `{output}` — Output tokens
 - `{cost}` — Estimated cost
 - `{duration}` — Time since conversation started
+- `{pipeline}` — Latest GitLab pipeline status for the current branch *(requires a token, see [GitLab integration](#gitlab-integration))*
+- `{mr}` — Count of open GitLab merge requests for the current branch, e.g. `2 MRs` *(requires a token)*
 
 Prefix with `?` to hide empty sections: `?{branch}` only shows if a branch is found.
 
@@ -70,12 +75,12 @@ Prefix with `?` to hide empty sections: `?{branch}` only shows if a branch is fo
 
 **Default:**
 ```
-{model} | {dir} | ?{branch} | {bar} {context}% | ?{cache} cached | ?{cost}
+{model} | {dir} | ?{branch} | ?{forge} | {bar} {context}% | ?{cache} cached | ?{pipeline} | ?{cost}
 ```
 
 **Full:**
 ```
-{model} | {dir} | ?{branch} | {bar} {context}% | ?{cache} cached | ?In: {input} | ?Out: {output} | ?{cost} | ?{duration}
+{model} | {dir} | ?{branch} | ?{forge} | {bar} {context}% | ?{cache} cached | ?{pipeline} | ?{mr} | ?In: {input} | ?Out: {output} | ?{cost} | ?{duration}
 ```
 
 ## Options
@@ -89,6 +94,9 @@ Prefix with `?` to hide empty sections: `?{branch}` only shows if a branch is fo
 -i, --icons                 Enable Nerd Font icons [default: true]
 --no-icons                  Disable icons
 -w, --bar-width <N>         Progress bar width in chars [default: 10]
+--no-gitlab                 Disable the GitLab API integration ({pipeline}, {mr})
+--gitlab-timeout <SECS>     Per-request timeout for GitLab API calls [default: 2]
+--gitlab-cache <SECS>       Reuse cached GitLab API results for N seconds [default: 30]
 ```
 
 ## Input Format
@@ -126,9 +134,63 @@ Color output adapts based on context usage:
 
 The `{branch}` field appears in yellow when a git branch is detected.
 
+The `{forge}` field is colored per host — GitLab orange, GitHub white, Bitbucket blue, and any other host shows a generic git icon in yellow.
+
+## GitLab integration
+
+constatus detects the hosting forge from your git remote entirely offline: the
+`{forge}` placeholder shows a GitLab/GitHub/Bitbucket icon based on
+`git remote get-url origin`. No token or network is required for `{forge}`.
+
+The optional `{pipeline}` and `{mr}` placeholders show, for the **current
+branch**, the latest GitLab CI pipeline status and the number of open merge
+requests. These query the GitLab API and activate only when **all** of the
+following hold:
+
+- the remote host is trusted for the API (see below),
+- a git branch is detected (a detached HEAD counts as no branch), and
+- an API token is available in the environment.
+
+The token is read from the first of `GITLAB_TOKEN`, `CONSTATUS_GITLAB_TOKEN`, or
+`CI_JOB_TOKEN`. Create a [personal access token](https://docs.gitlab.com/ee/user/profile/personal_access_tokens.html)
+with the `read_api` scope:
+
+```bash
+export GITLAB_TOKEN=glpat-xxxxxxxxxxxxxxxxxxxx
+```
+
+**Trusted hosts.** So your token is never sent to a look-alike domain, the
+authenticated API is called only for `gitlab.com` and its subdomains by default.
+For a **self-hosted** instance, opt in explicitly with a comma-separated
+allowlist of exact hostnames (the offline `{forge}` icon needs no such opt-in):
+
+```bash
+export CONSTATUS_GITLAB_HOST=gitlab.example.com
+```
+
+**How it works (and why it's safe for a status line):**
+
+- Requests are made by shelling out to `curl` (no extra build dependencies);
+  the token is passed via curl's stdin config, never in the process arguments.
+- Each request is bounded by `--gitlab-timeout` (default 2s, and the pipeline +
+  MR requests run concurrently) so a render never hangs. Results are cached
+  under `$XDG_CACHE_HOME/constatus` (or `~/.cache/constatus`) for
+  `--gitlab-cache` seconds (default 30s), so a frequently-redrawn status line
+  makes at most one round of API calls (pipeline + MRs) per cache window.
+- Anything missing or failing (no token, no `curl`, network error, untrusted or
+  non-GitLab remote) is silently omitted — pair the placeholders with `?` to
+  hide them.
+- Disable the API path entirely with `--no-gitlab`; `{forge}` still works.
+
+`{pipeline}` is colored by status (green = passed, red = failed, yellow =
+running/pending, magenta = canceled/manual/skipped); `{mr}` shows the open MR
+count for the current branch (e.g. ` 2 MRs`).
+
 ## Features
 
 - **Git branch detection:** Runs `git rev-parse --abbrev-ref HEAD` in the workspace directory
+- **Forge detection:** Identifies GitLab/GitHub/Bitbucket from the git remote, fully offline
+- **GitLab status (optional):** Pipeline and merge-request status for the current branch via the GitLab API, gated on a token and cached
 - **Token tracking:** Displays input, output, and cache read tokens with abbreviations (k, M)
 - **Cost estimation:** Calculates approximate API costs based on token counts
 - **Graceful degradation:** Missing data is silently omitted (especially useful with `?` prefix)

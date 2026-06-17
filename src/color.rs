@@ -77,17 +77,22 @@ pub enum Color {
     Blue,
     Magenta,
     Cyan,
+    White,
+    /// 256-color orange — used for the GitLab brand.
+    Orange,
 }
 
 impl Color {
-    fn code(self) -> u8 {
+    fn code(self) -> &'static str {
         match self {
-            Self::Red => 31,
-            Self::Green => 32,
-            Self::Yellow => 33,
-            Self::Blue => 34,
-            Self::Magenta => 35,
-            Self::Cyan => 36,
+            Self::Red => "31",
+            Self::Green => "32",
+            Self::Yellow => "33",
+            Self::Blue => "34",
+            Self::Magenta => "35",
+            Self::Cyan => "36",
+            Self::White => "37",
+            Self::Orange => "38;5;208",
         }
     }
 }

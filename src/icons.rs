@@ -23,3 +23,16 @@ pub const CLOCK: &str = "\u{f017}";   //  nf-fa-clock_o
 pub const BRANCH: &str = "\u{e725}";  //  nf-dev-git_branch
 pub const BAR_FULL: char = '█';
 pub const BAR_EMPTY: char = '░';
+
+// Forge (remote host) icons.
+pub const GITLAB: &str = "\u{f296}";    //  nf-fa-gitlab
+pub const GITHUB: &str = "\u{f09b}";    //  nf-fa-github
+pub const BITBUCKET: &str = "\u{f171}"; //  nf-fa-bitbucket
+pub const GIT: &str = "\u{e702}";       //  nf-dev-git (generic)
+
+// GitLab merge-request and pipeline icons.
+pub const MR: &str = "\u{f407}";        //  nf-oct-git_pull_request
+pub const PIPE_OK: &str = "\u{f058}";   //  nf-fa-check_circle (passed)
+pub const PIPE_FAIL: &str = "\u{f057}"; //  nf-fa-times_circle (failed)
+pub const PIPE_RUN: &str = "\u{f021}";  //  nf-fa-refresh (running/pending)
+pub const PIPE_WARN: &str = "\u{f071}"; //  nf-fa-warning (canceled/manual/skipped)

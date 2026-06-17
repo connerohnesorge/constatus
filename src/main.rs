@@ -1,6 +1,8 @@
 mod bar;
 mod color;
 mod cost;
+mod forge;
+mod gitlab;
 mod icons;
 
 use clap::Parser;
@@ -11,8 +13,8 @@ use std::io::Read;
 #[derive(Parser)]
 #[command(name = "constatus", about = "Configurable status line for Claude Code")]
 struct Cli {
-    /// Format string with placeholders: {model}, {dir}, {branch}, {context}, {bar}, {cache},
-    /// {input}, {output}, {cost}, {duration}.
+    /// Format string with placeholders: {model}, {dir}, {branch}, {forge}, {context}, {bar},
+    /// {cache}, {input}, {output}, {cost}, {duration}, {pipeline}, {mr}.
     /// Sections separated by ' | '. Prefix with '?' to hide when empty.
     #[arg(short, long)]
     format: Option<String>,
@@ -44,6 +46,19 @@ struct Cli {
     /// Progress bar width (chars)
     #[arg(short = 'w', long, default_value_t = 10)]
     bar_width: usize,
+
+    /// Disable the optional GitLab API integration ({pipeline}, {mr}).
+    /// The offline {forge} placeholder is unaffected.
+    #[arg(long)]
+    no_gitlab: bool,
+
+    /// Per-request timeout for GitLab API calls, in seconds
+    #[arg(long, default_value_t = 2)]
+    gitlab_timeout: u64,
+
+    /// Reuse cached GitLab API results for this many seconds
+    #[arg(long, default_value_t = 30)]
+    gitlab_cache: u64,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -71,10 +86,10 @@ impl Preset {
         match self {
             Self::Minimal => "{model} | {dir} | ?{branch}",
             Self::Default => {
-                "{model} | {dir} | ?{branch} | {bar} {context}% | ?{cache} cached | ?{cost}"
+                "{model} | {dir} | ?{branch} | ?{forge} | {bar} {context}% | ?{cache} cached | ?{pipeline} | ?{cost}"
             }
             Self::Full => {
-                "{model} | {dir} | ?{branch} | {bar} {context}% | ?{cache} cached | ?In: {input} | ?Out: {output} | ?{cost} | ?{duration}"
+                "{model} | {dir} | ?{branch} | ?{forge} | {bar} {context}% | ?{cache} cached | ?{pipeline} | ?{mr} | ?In: {input} | ?Out: {output} | ?{cost} | ?{duration}"
             }
         }
     }
@@ -141,7 +156,18 @@ fn main() {
         .as_deref()
         .unwrap_or_else(|| cli.preset.format_str());
 
-    let fields = extract_fields(&status, &style, use_icons, cli.bar_width);
+    let gl_cfg = gitlab::Config {
+        timeout_secs: cli.gitlab_timeout,
+        cache_secs: cli.gitlab_cache,
+    };
+    let fields = extract_fields(
+        &status,
+        &style,
+        use_icons,
+        cli.bar_width,
+        !cli.no_gitlab,
+        &gl_cfg,
+    );
 
     let sections: Vec<&str> = format_str.split(" | ").collect();
     let mut parts: Vec<String> = Vec::new();
@@ -171,6 +197,7 @@ struct Fields {
     model: String,
     dir: String,
     branch: String,
+    forge: String,
     context: String,
     bar: String,
     cache: String,
@@ -178,6 +205,8 @@ struct Fields {
     output: String,
     cost: String,
     duration: String,
+    pipeline: String,
+    mr: String,
 }
 
 fn extract_fields(
@@ -185,6 +214,8 @@ fn extract_fields(
     style: &Style,
     use_icons: bool,
     bar_width: usize,
+    gitlab_enabled: bool,
+    gl_cfg: &gitlab::Config,
 ) -> Fields {
     let model_raw = status
         .model
@@ -237,6 +268,10 @@ fn extract_fields(
                 .filter(|o| o.status.success())
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         })
+        // On a detached HEAD `rev-parse --abbrev-ref` prints the literal
+        // "HEAD"; treat that as "no branch" so we neither show a bogus chip
+        // nor fire meaningless GitLab queries for a ref named HEAD.
+        .filter(|b| b != "HEAD")
         .unwrap_or_default();
 
     let branch = if branch_raw.is_empty() {
@@ -249,6 +284,31 @@ fn extract_fields(
         };
         style.fg(Color::Yellow, &format!("{icon}{branch_raw}"))
     };
+
+    // Detect the hosting forge from the git remote (offline).
+    let remote = workspace_dir.and_then(forge::detect);
+
+    let forge = remote
+        .as_ref()
+        .map(|r| {
+            let icon = if use_icons {
+                format!("{} ", r.forge.icon())
+            } else {
+                String::new()
+            };
+            style.fg(r.forge.color(), &format!("{icon}{}", r.forge.label()))
+        })
+        .unwrap_or_default();
+
+    // Optional GitLab API status (pipeline + open MRs for the current branch).
+    let (pipeline, mr) = gitlab_fields(
+        remote.as_ref(),
+        &branch_raw,
+        gitlab_enabled,
+        gl_cfg,
+        style,
+        use_icons,
+    );
 
     let remaining = status
         .context_window
@@ -363,6 +423,7 @@ fn extract_fields(
         model,
         dir,
         branch,
+        forge,
         context,
         bar: bar_str,
         cache,
@@ -370,7 +431,66 @@ fn extract_fields(
         output,
         cost: cost_str,
         duration,
+        pipeline,
+        mr,
     }
+}
+
+/// Resolve the GitLab `{pipeline}` and `{mr}` fields. Returns empty strings
+/// unless the integration is enabled, the remote is GitLab, a branch is known,
+/// and a token is present in the environment.
+fn gitlab_fields(
+    remote: Option<&forge::Remote>,
+    branch_raw: &str,
+    gitlab_enabled: bool,
+    gl_cfg: &gitlab::Config,
+    style: &Style,
+    use_icons: bool,
+) -> (String, String) {
+    let empty = || (String::new(), String::new());
+
+    if !gitlab_enabled || branch_raw.is_empty() {
+        return empty();
+    }
+    let Some(remote) = remote.filter(|r| r.forge == forge::Forge::GitLab) else {
+        return empty();
+    };
+    let Some(token) = gitlab::token_from_env() else {
+        return empty();
+    };
+
+    let status = gitlab::fetch_status(remote, branch_raw, &token, gl_cfg);
+
+    let pipeline = status
+        .pipeline
+        .as_deref()
+        .map(|s| {
+            let icon = if use_icons {
+                format!("{} ", gitlab::pipeline_icon(s))
+            } else {
+                String::new()
+            };
+            style.fg(
+                gitlab::pipeline_color(s),
+                &format!("{icon}{}", gitlab::pipeline_label(s)),
+            )
+        })
+        .unwrap_or_default();
+
+    let mr = match status.mr_count {
+        Some(n) if n > 0 => {
+            let icon = if use_icons {
+                format!("{} ", icons::MR)
+            } else {
+                String::new()
+            };
+            let noun = if n == 1 { "MR" } else { "MRs" };
+            style.fg(Color::Cyan, &format!("{icon}{n} {noun}"))
+        }
+        _ => String::new(),
+    };
+
+    (pipeline, mr)
 }
 
 fn substitute(template: &str, f: &Fields) -> String {
@@ -378,6 +498,7 @@ fn substitute(template: &str, f: &Fields) -> String {
         .replace("{model}", &f.model)
         .replace("{dir}", &f.dir)
         .replace("{branch}", &f.branch)
+        .replace("{forge}", &f.forge)
         .replace("{context}", &f.context)
         .replace("{bar}", &f.bar)
         .replace("{cache}", &f.cache)
@@ -385,12 +506,15 @@ fn substitute(template: &str, f: &Fields) -> String {
         .replace("{output}", &f.output)
         .replace("{cost}", &f.cost)
         .replace("{duration}", &f.duration)
+        .replace("{pipeline}", &f.pipeline)
+        .replace("{mr}", &f.mr)
 }
 
 fn has_empty_placeholder(template: &str, f: &Fields) -> bool {
     (template.contains("{model}") && f.model.is_empty())
         || (template.contains("{dir}") && f.dir.is_empty())
         || (template.contains("{branch}") && f.branch.is_empty())
+        || (template.contains("{forge}") && f.forge.is_empty())
         || (template.contains("{context}") && f.context.is_empty())
         || (template.contains("{bar}") && f.bar.is_empty())
         || (template.contains("{cache}") && f.cache.is_empty())
@@ -398,6 +522,8 @@ fn has_empty_placeholder(template: &str, f: &Fields) -> bool {
         || (template.contains("{output}") && f.output.is_empty())
         || (template.contains("{cost}") && f.cost.is_empty())
         || (template.contains("{duration}") && f.duration.is_empty())
+        || (template.contains("{pipeline}") && f.pipeline.is_empty())
+        || (template.contains("{mr}") && f.mr.is_empty())
 }
 
 fn model_color(name: &str) -> Color {
